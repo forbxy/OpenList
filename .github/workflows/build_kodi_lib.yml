@@ -1,0 +1,216 @@
+name: Build Kodi Library
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name (leave empty to auto-detect from kodi_lib branch)'
+        required: false
+        default: 'auto'
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-tag:
+    name: Determine Tag
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.set_tag.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: kodi_lib
+          fetch-depth: 0
+
+      - name: Determine Tag
+        id: set_tag
+        run: |
+           INPUT_TAG="${{ inputs.tag_name }}"
+           if [ -z "$INPUT_TAG" ] || [ "$INPUT_TAG" == "auto" ]; then
+                DETECTED_TAG=$(git describe --tags --abbrev=0)
+                echo "Auto-detected tag: $DETECTED_TAG"
+                echo "tag=$DETECTED_TAG" >> $GITHUB_OUTPUT
+           else
+                echo "Using input tag: $INPUT_TAG"
+                echo "tag=$INPUT_TAG" >> $GITHUB_OUTPUT
+           fi
+
+  build-library:
+    name: Build Library
+    needs: prepare-tag
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # Added: prevent cancelling other jobs if one fails
+      matrix:
+        include:
+          # Windows
+          - target: windows-amd64
+            goos: windows
+            goarch: amd64
+            cc: x86_64-w64-mingw32-gcc
+            ext: .dll
+            kodi_arch: x86_64
+          - target: windows-386
+            goos: windows
+            goarch: 386
+            cc: i686-w64-mingw32-gcc
+            ext: .dll
+            kodi_arch: i686
+
+          # Linux
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+            cc: gcc
+            ext: .so
+            kodi_arch: x86_64
+          - target: linux-386
+            goos: linux
+            goarch: 386
+            cc: gcc -m32
+            ext: .so
+            kodi_arch: i686
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+            cc: aarch64-linux-gnu-gcc
+            ext: .so
+            kodi_arch: aarch64
+          - target: linux-arm
+            goos: linux
+            goarch: arm
+            cc: arm-linux-gnueabihf-gcc
+            ext: .so
+            kodi_arch: armv7
+
+          # Android
+          - target: android-arm64
+            goos: android
+            goarch: arm64
+            ext: .so
+            kodi_arch: aarch64
+            api: 24
+          - target: android-arm
+            goos: android
+            goarch: arm
+            ext: .so
+            kodi_arch: armv7 
+            api: 24
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: kodi_lib
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.0"
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64
+          sudo apt-get install -y gcc-i686-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-arm-linux-gnueabihf
+          
+          # Fix for bits/libc-header-start.h: No such file or directory
+          # When cross-compiling for 32-bit Linux on 64-bit host
+          if [[ "${{ matrix.target }}" == "linux-386" ]]; then
+            sudo apt-get install -y libc6-dev-i386
+          fi
+
+          sudo apt-get install -y build-essential
+
+      - name: Setup Android NDK
+        if: ${{ contains(matrix.target, 'android') }}
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK
+        id: setup-ndk
+        if: ${{ contains(matrix.target, 'android') }}
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c
+
+      - name: Fetch Frontend
+        run: |
+          pip install requests
+          python kodi_lib/fetch_frontend.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Library
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+          CGO_ENABLED: 1
+          TAG_NAME: ${{ needs.prepare-tag.outputs.release_tag }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+            echo "Using Tag: $TAG_NAME"
+            
+            # Configure CC for Android if needed
+            if [[ "${{ matrix.target }}" == *"android"* ]]; then
+               # Find toolchain path
+               NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+               if [[ "${{ matrix.goarch }}" == "arm64" ]]; then
+                  export CC="$NDK_TOOLCHAIN/aarch64-linux-android${{ matrix.api }}-clang"
+               elif [[ "${{ matrix.goarch }}" == "arm" ]]; then
+                  export CC="$NDK_TOOLCHAIN/armv7a-linux-androideabi${{ matrix.api }}-clang"
+               fi
+               echo "Set Android CC to $CC"
+            fi
+
+            # Strip 'v' from tag for filename if presents
+            VERSION=${TAG_NAME#v}
+          
+            OUTPUT_NAME="libopenlist-${VERSION}-${{ matrix.goos }}-${{ matrix.kodi_arch }}${{ matrix.ext }}"
+          
+            echo "Building $OUTPUT_NAME..."
+          
+            go build -buildmode=c-shared -o "output/$OUTPUT_NAME" kodi_lib/lib_openlist.go
+          
+            ls -l output/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libopenlist-${{ matrix.target }}
+          path: output/libopenlist*
+
+  release:
+    needs: [prepare-tag, build-library]
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.prepare-tag.outputs.release_tag }}
+    steps:
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Delete Existing Release
+        uses: dev-drprasad/delete-tag-and-release@v1.1
+        with:
+          delete_release: true
+          tag_name: ${{ env.RELEASE_TAG }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Kodi Library ${{ env.RELEASE_TAG }}
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
